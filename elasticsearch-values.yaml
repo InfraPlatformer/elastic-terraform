@@ -1,0 +1,76 @@
+# Elasticsearch Helm Chart Values
+# This file configures the Elasticsearch deployment for the CI/CD pipeline
+
+# Elasticsearch Configuration
+clusterName: "elasticsearch"
+nodeGroup: "elasticsearch"
+
+# Resource Configuration
+resources:
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+  requests:
+    cpu: "1000m"
+    memory: "2Gi"
+
+# Java Options
+esJavaOpts: "-Xms1g -Xmx1g"
+
+# Replicas
+replicas: 1
+
+# Storage Configuration
+volumeClaimTemplate:
+  resources:
+    requests:
+      storage: 50Gi
+  accessModes: ["ReadWriteOnce"]
+
+# Security Configuration
+xpack:
+  security:
+    enabled: false
+    http:
+      ssl:
+        enabled: false
+    transport:
+      ssl:
+        enabled: false
+
+# Health Checks
+livenessProbe:
+  failureThreshold: 3
+  initialDelaySeconds: 120
+  periodSeconds: 20
+
+readinessProbe:
+  failureThreshold: 3
+  initialDelaySeconds: 90
+  periodSeconds: 15
+
+# Node Selector for EKS
+nodeSelector:
+  nodegroup: elasticsearch
+
+# Tolerations
+tolerations:
+- effect: NoSchedule
+  key: dedicated
+  value: elasticsearch
+
+# Service Configuration
+service:
+  type: ClusterIP
+  port: 9200
+
+# Ingress (disabled by default)
+ingress:
+  enabled: false
+
+# Monitoring
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s

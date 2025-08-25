@@ -1,0 +1,306 @@
+name: Terraform Infrastructure Pipeline
+
+on:
+  push:
+    branches: [main, develop, feature/*]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+        - development
+        - staging
+        - production
+
+env:
+  TF_VERSION: "1.5.0"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  # Security and Code Quality Checks
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Terraform Validation and Security
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      
+    - name: Terraform Validate
+      run: terraform validate
+      
+    - name: Run TFSec
+      uses: aquasecurity/tfsec-action@v1.0.0
+      with:
+        working_directory: .
+        
+    - name: Run Checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: .
+        framework: terraform
+        output_format: sarif
+        output_file_path: checkov-results.sarif
+        
+    - name: Upload Checkov results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'checkov-results.sarif'
+
+  # Helm Chart Validation
+  helm-validate:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'v3.12.0'
+        
+    - name: Lint Elasticsearch Helm chart
+      run: |
+        helm lint examples/elasticsearch
+        helm lint examples/kibana
+        
+    - name: Validate Helm values
+      run: |
+        helm template examples/elasticsearch -f examples/elasticsearch/values.yaml | kubeval --strict
+        helm template examples/kibana -f examples/kibana/values.yaml | kubeval --strict
+
+  # Development Environment Deployment
+  deploy-development:
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, helm-validate]
+    if: github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'development'
+    environment: development
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Plan
+      run: terraform plan -var-file="environments/development/terraform.tfvars" -out=tfplan-dev
+      
+    - name: Terraform Apply
+      run: terraform apply tfplan-dev
+      
+    - name: Wait for EKS cluster
+      run: |
+        aws eks update-kubeconfig --name elasticsearch-cluster-dev --region ${{ env.AWS_REGION }}
+        kubectl wait --for=condition=ready nodes --all --timeout=300s
+        
+    - name: Deploy Elasticsearch
+      run: |
+        helm upgrade --install elasticsearch elastic/elasticsearch \
+          --namespace elasticsearch \
+          --create-namespace \
+          -f elasticsearch-values.yaml \
+          --set clusterName=elasticsearch-dev
+          
+    - name: Deploy Kibana
+      run: |
+        helm upgrade --install kibana elastic/kibana \
+          --namespace elasticsearch \
+          -f kibana-values.yaml \
+          --set elasticsearchHosts=http://elasticsearch-master:9200
+          
+    - name: Health Check
+      run: |
+        kubectl wait --for=condition=ready pod -l app=kibana -n elasticsearch --timeout=300s
+        kubectl get all -n elasticsearch
+
+  # Staging Environment Deployment
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, helm-validate]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment: staging
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_STAGING }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_STAGING }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Plan
+      run: terraform plan -var-file="environments/staging/terraform.tfvars" -out=tfplan-staging
+      
+    - name: Terraform Apply
+      run: terraform apply tfplan-staging
+      
+    - name: Deploy with production-like settings
+      run: |
+        aws eks update-kubeconfig --name elasticsearch-cluster-staging --region ${{ env.AWS_REGION }}
+        helm upgrade --install elasticsearch elastic/elasticsearch \
+          --namespace elasticsearch \
+          --create-namespace \
+          -f elasticsearch-values.yaml \
+          --set clusterName=elasticsearch-staging \
+          --set replicas=3
+        helm upgrade --install kibana elastic/kibana \
+          --namespace elasticsearch \
+          -f kibana-values.yaml
+
+  # Production Environment Deployment
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, helm-validate]
+    if: github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Plan
+      run: terraform plan -var-file="environments/production/terraform.tfvars" -out=tfplan-prod
+      
+    - name: Manual Approval Required
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.setFailed('Production deployment requires manual approval in GitHub')
+          
+    - name: Terraform Apply (After Approval)
+      run: terraform apply tfplan-prod
+      
+    - name: Deploy Production Stack
+      run: |
+        aws eks update-kubeconfig --name elasticsearch-cluster-prod --region ${{ env.AWS_REGION }}
+        helm upgrade --install elasticsearch elastic/elasticsearch \
+          --namespace elasticsearch \
+          --create-namespace \
+          -f elasticsearch-values.yaml \
+          --set clusterName=elasticsearch-prod \
+          --set replicas=5 \
+          --set resources.limits.memory=8Gi \
+          --set resources.limits.cpu=4000m
+
+  # Post-Deployment Testing
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: [deploy-development, deploy-staging]
+    if: always() && (needs.deploy-development.result == 'success' || needs.deploy-staging.result == 'success')
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Run Integration Tests
+      run: |
+        # Test Elasticsearch connectivity
+        aws eks update-kubeconfig --name elasticsearch-cluster-dev --region ${{ env.AWS_REGION }}
+        kubectl wait --for=condition=ready pod -l app=elasticsearch -n elasticsearch --timeout=300s
+        
+        # Test Kibana accessibility
+        kubectl wait --for=condition=ready pod -l app=kibana -n elasticsearch --timeout=300s
+        
+        # Basic health checks
+        kubectl get all -n elasticsearch
+        kubectl get nodes
+
+  # Cleanup and Notifications
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-development, deploy-staging, deploy-production, integration-tests]
+    if: always()
+    steps:
+    - name: Deployment Summary
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const summary = {
+            development: '${{ needs.deploy-development.result }}',
+            staging: '${{ needs.deploy-staging.result }}',
+            production: '${{ needs.deploy-production.result }}',
+            tests: '${{ needs.integration-tests.result }}'
+          };
+          
+          console.log('Deployment Summary:', JSON.stringify(summary, null, 2));
+          
+          if (summary.development === 'success' || summary.staging === 'success') {
+            core.notice('✅ Infrastructure deployed successfully!');
+          } else {
+            core.setFailed('❌ Deployment failed. Check logs for details.');
+          }

@@ -1,0 +1,132 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+!*-example.tfvars
+!environments/*/terraform.tfvars
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate.backup
+tfplan*
+*.tfplan
+*.tfplan.*
+
+# AWS
+.aws/
+aws-credentials
+*.pem
+*.key
+
+# Kubernetes
+.kube/
+kubeconfig
+*.kubeconfig
+
+# Helm
+*.tgz
+charts/*.tgz
+
+# Logs
+*.log
+logs/
+*.out
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# PowerShell
+*.ps1.log
+*.ps1.error
+
+# Backup files
+backup_*/
+*.backup
+*.bak
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Sensitive information
+secrets/
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Terraform provider cache
+.terraform.d/
+.terraform.tfstate.lock.info
+
+# Local development
+local/
+dev-local/
+*.local
+
+# Test outputs
+test-results/
+coverage/
+*.test
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Node modules (if any frontend components)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python (if any Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Windows
+*.lnk
+desktop.ini
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Project specific
+terraform-state-backup-*.json
+tfstate-backup-*.json

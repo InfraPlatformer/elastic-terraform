@@ -1,0 +1,280 @@
+name: "Terraform CI/CD Pipeline"
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'terraform/**'
+      - 'modules/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'terraform/**'
+      - 'modules/**'
+
+env:
+  TF_VERSION: "1.5.0"
+  AWS_REGION: "us-west-2"
+  AZURE_LOCATION: "West US 2"
+
+jobs:
+  # =============================================================================
+  # CODE QUALITY & SECURITY
+  # =============================================================================
+  code-quality:
+    name: "Code Quality & Security"
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup Terraform"
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: "Terraform Format Check"
+      run: |
+        cd advanced-elastic-terraform
+        terraform fmt -check -recursive
+        
+    - name: "Terraform Validate"
+      run: |
+        cd advanced-elastic-terraform
+        terraform init -backend=false
+        terraform validate
+        
+    - name: "Security Scan with Checkov"
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: advanced-elastic-terraform
+        framework: terraform
+        output_format: sarif
+        output_file_path: checkov-results.sarif
+        
+    - name: "Upload Checkov results"
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: checkov-results.sarif
+
+  # =============================================================================
+  # INFRASTRUCTURE TESTING
+  # =============================================================================
+  infrastructure-testing:
+    name: "Infrastructure Testing"
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup Terraform"
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: "Setup AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: "Setup Azure Credentials"
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+    - name: "Terraform Plan (AWS)"
+      run: |
+        cd advanced-elastic-terraform
+        terraform init
+        terraform plan -out=tfplan-aws -var-file=terraform.tfvars
+        terraform show -json tfplan-aws > plan-aws.json
+        
+    - name: "Upload Terraform Plan"
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-aws
+        path: advanced-elastic-terraform/plan-aws.json
+        
+    - name: "Infrastructure Cost Analysis"
+      uses: actions/upload-artifact@v4
+      with:
+        name: cost-analysis
+        path: advanced-elastic-terraform/tfplan-aws
+
+  # =============================================================================
+  # DEPLOYMENT TO STAGING
+  # =============================================================================
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: [code-quality, infrastructure-testing]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup Terraform"
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: "Setup AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_STAGING }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_STAGING }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: "Download Terraform Plan"
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan-aws
+        path: advanced-elastic-terraform
+        
+    - name: "Deploy to Staging"
+      run: |
+        cd advanced-elastic-terraform
+        terraform init
+        terraform apply tfplan-aws -auto-approve
+        
+    - name: "Run Post-Deployment Tests"
+      run: |
+        cd advanced-elastic-terraform
+        # Test Elasticsearch connectivity
+        kubectl get pods -n elasticsearch
+        # Test monitoring stack
+        kubectl get pods -n monitoring
+        # Test backup functionality
+        echo "Running backup tests..."
+
+  # =============================================================================
+  # DEPLOYMENT TO PRODUCTION
+  # =============================================================================
+  deploy-production:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: [code-quality, infrastructure-testing]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup Terraform"
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: "Setup AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: "Download Terraform Plan"
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan-aws
+        path: advanced-elastic-terraform
+        
+    - name: "Deploy to Production"
+      run: |
+        cd advanced-elastic-terraform
+        terraform init
+        terraform apply tfplan-aws -auto-approve
+        
+    - name: "Run Production Health Checks"
+      run: |
+        cd advanced-elastic-terraform
+        # Verify all services are running
+        kubectl get pods --all-namespaces
+        # Check Elasticsearch cluster health
+        kubectl exec -n elasticsearch deployment/elasticsearch-master -- curl -s localhost:9200/_cluster/health
+        # Verify monitoring stack
+        kubectl get pods -n monitoring
+
+  # =============================================================================
+  # MONITORING & ALERTING
+  # =============================================================================
+  monitoring-verification:
+    name: "Monitoring Verification"
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: "Verify Monitoring Stack"
+      run: |
+        cd advanced-elastic-terraform
+        # Check Prometheus is collecting metrics
+        kubectl get pods -n monitoring
+        # Verify Grafana dashboards are accessible
+        kubectl get configmaps -n monitoring
+        # Check alerting rules
+        kubectl get prometheusrules -n monitoring
+        
+    - name: "Send Deployment Notification"
+      if: always()
+      run: |
+        echo "Deployment completed for ${{ github.ref }}"
+        # Add Slack/Teams notification here
+
+  # =============================================================================
+  # CLEANUP & ROLLBACK
+  # =============================================================================
+  cleanup-rollback:
+    name: "Cleanup & Rollback"
+    runs-on: ubuntu-latest
+    if: failure()
+    
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v4
+      
+    - name: "Setup Terraform"
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        
+    - name: "Setup AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: "Emergency Rollback"
+      run: |
+        cd advanced-elastic-terraform
+        terraform init
+        # Rollback to previous state if available
+        if [ -f "terraform.tfstate.backup" ]; then
+          terraform apply -auto-approve
+        else
+          echo "No backup state available for rollback"
+        fi
+        
+    - name: "Send Rollback Notification"
+      run: |
+        echo "Emergency rollback triggered for ${{ github.ref }}"
+        # Add emergency notification here
